@@ -258,13 +258,14 @@ class FactualCorrectness(MetricWithLLM, SingleTurnMetric):
         return claims_list
 
     async def verify_claims(
-        self, premise: str, hypothesis_list: t.List[str], callbacks: Callbacks
+        self, premise: str, hypothesis_list: t.List[str], callbacks: Callbacks, saveresults_prefix=''
     ) -> NDArray[np.bool_]:
         assert self.llm is not None, "LLM must be set"
         prompt_input = NLIStatementInput(context=premise, statements=hypothesis_list)
         response = await self.nli_prompt.generate(
             data=prompt_input, llm=self.llm, callbacks=callbacks
         )
+        self.intermediate_results[saveresults_prefix + 'nliresponse'] = response
         return np.array([bool(result.verdict) for result in response.statements])
 
     async def _single_turn_ascore(
@@ -275,31 +276,49 @@ class FactualCorrectness(MetricWithLLM, SingleTurnMetric):
         assert self.llm is not None, "LLM must be set"
         assert reference is not None, "Reference is not set"
         assert response is not None, "Response is not set"
-
+        # Store intermediate results
+        self.intermediate_results = {}
+        
         response_claims = await self.decompose_claims(response, callbacks)
+        self.intermediate_results['response_claims'] = response_claims
+        
         reference_response = await self.verify_claims(
-            premise=reference, hypothesis_list=response_claims, callbacks=callbacks
+            premise=reference, hypothesis_list=response_claims, callbacks=callbacks, saveresults_prefix='precision_'
         )
+        self.intermediate_results['precision_verdicts'] = reference_response
 
         if self.mode != "precision":
             reference_claims = await self.decompose_claims(reference, callbacks)
+            self.intermediate_results['reference_claims'] = reference_claims
+            
             response_reference = await self.verify_claims(
-                premise=response, hypothesis_list=reference_claims, callbacks=callbacks
+                premise=response, hypothesis_list=reference_claims, callbacks=callbacks, saveresults_prefix='recall_'
             )
+            self.intermediate_results['response_reference'] = response_reference
         else:
             response_reference = np.array([])
+            self.intermediate_results['recall_verdicts'] = response_reference
 
         tp = sum(reference_response)
+        self.intermediate_results['tp'] = tp
         fp = sum(~reference_response)
+        self.intermediate_results['fp'] = fp
         if self.mode != "precision":
             fn = sum(~response_reference)
+            self.intermediate_results['fn'] = fn
         else:
             fn = 0
-
+        
+        precision = tp / (tp + fp + 1e-8)
+        recall = tp / (tp + fn + 1e-8)
+        self.intermediate_results['precision'] = precision
+        self.intermediate_results['recall'] = recall
         if self.mode == "precision":
-            score = tp / (tp + fp + 1e-8)
+            score = precision
+        # TODO: this calculation is incorrect if using entailment - numerator should be a different tp than precision, because 
+        # entailment is in different directions
         elif self.mode == "recall":
-            score = tp / (tp + fn + 1e-8)
+            score = recall
         else:
             score = fbeta_score(tp, fp, fn, self.beta)
 
