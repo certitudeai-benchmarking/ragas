@@ -278,10 +278,10 @@ class FactualCorrectness(MetricWithLLM, SingleTurnMetric):
         assert response is not None, "Response is not set"
         # Store intermediate results
         self.intermediate_results = {}
-        
+
         response_claims = await self.decompose_claims(response, callbacks)
         self.intermediate_results['response_claims'] = response_claims
-        
+
         reference_response = await self.verify_claims(
             premise=reference, hypothesis_list=response_claims, callbacks=callbacks, saveresults_prefix='precision_'
         )
@@ -290,11 +290,11 @@ class FactualCorrectness(MetricWithLLM, SingleTurnMetric):
         if self.mode != "precision":
             reference_claims = await self.decompose_claims(reference, callbacks)
             self.intermediate_results['reference_claims'] = reference_claims
-            
+
             response_reference = await self.verify_claims(
                 premise=response, hypothesis_list=reference_claims, callbacks=callbacks, saveresults_prefix='recall_'
             )
-            self.intermediate_results['response_reference'] = response_reference
+            self.intermediate_results["recall_verdicts"] = response_reference
         else:
             response_reference = np.array([])
             self.intermediate_results['recall_verdicts'] = response_reference
@@ -308,14 +308,14 @@ class FactualCorrectness(MetricWithLLM, SingleTurnMetric):
             self.intermediate_results['fn'] = fn
         else:
             fn = 0
-        
+
         precision = tp / (tp + fp + 1e-8)
         recall = tp / (tp + fn + 1e-8)
         self.intermediate_results['precision'] = precision
         self.intermediate_results['recall'] = recall
         if self.mode == "precision":
             score = precision
-        # TODO: this calculation is incorrect if using entailment - numerator should be a different tp than precision, because 
+        # TODO: this calculation is incorrect if using entailment - numerator should be a different tp than precision, because
         # entailment is in different directions
         elif self.mode == "recall":
             score = recall

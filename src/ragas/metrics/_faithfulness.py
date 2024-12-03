@@ -226,7 +226,7 @@ class Faithfulness(MetricWithLLM, SingleTurnMetric):
             for i, sentence in enumerate(sentences)
             if sentence.strip().endswith((".", "。", "!", "！"))
         }
-        self.intermediate_output["statements"] = sentences_with_index
+        self.intermediate_results["statements"] = sentences_with_index
 
         statements_simplified = await self.statement_prompt.generate(
             llm=self.llm,
@@ -243,8 +243,8 @@ class Faithfulness(MetricWithLLM, SingleTurnMetric):
             1 if answer.verdict else 0 for answer in answers.statements
         )
         num_statements = len(answers.statements)
-        self.intermediate_output["faithful_statements"] = faithful_statements
-        self.intermediate_output["num_statements"] = num_statements
+        self.intermediate_results["faithful_statements"] = faithful_statements
+        self.intermediate_results["num_statements"] = num_statements
         if num_statements:
             score = faithful_statements / num_statements
         else:
@@ -264,12 +264,12 @@ class Faithfulness(MetricWithLLM, SingleTurnMetric):
         returns the NLI score for each (q, c, a) pair
         """
         assert self.llm is not None, "LLM is not set"
-        
-        self.intermediate_output = {}
-        
+
+        self.intermediate_results: dict[str, t.Any] = {}
+
         statements_simplified = await self._create_statements(row, callbacks)
-        self.intermediate_output["statements_simplified"] = statements_simplified
-        
+        self.intermediate_results["statements_simplified"] = statements_simplified
+
         if statements_simplified is None:
             return np.nan
 
@@ -277,10 +277,10 @@ class Faithfulness(MetricWithLLM, SingleTurnMetric):
         statements = []
         for component in statements_simplified.sentences:
             statements.extend(component.simpler_statements)
-        self.intermediate_output["statements_simplified_flat"] = statements_simplified
+        self.intermediate_results["statements_simplified_flat"] = statements
 
         verdicts = await self._create_verdicts(row, statements, callbacks)
-        self.intermediate_output["verdicts"] = verdicts
+        self.intermediate_results["verdicts"] = verdicts
         return self._compute_score(verdicts)
 
 
