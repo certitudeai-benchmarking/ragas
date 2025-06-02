@@ -371,6 +371,8 @@ class ResponseGroundedness(MetricWithLLM, SingleTurnMetric):
         assert sample.response is not None, "Response is not set"
         assert sample.retrieved_contexts is not None, "Retrieved Context is not set"
 
+        self.intermediate_results = {}
+
         if (sample.response.strip() == "") or (
             "\n".join(sample.retrieved_contexts).strip().strip() == ""
         ):
@@ -419,7 +421,8 @@ class ResponseGroundedness(MetricWithLLM, SingleTurnMetric):
                     break
                 else:
                     logger.warning(f"Retry: {retry}")
-
+            self.intermediate_results["score0"] = score0
+            self.intermediate_results["score1"] = score1
             score = self.average_scores(score0, score1)
 
         except Exception as e:
