@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_serializer
 
 
 class UUIDEncoder(json.JSONEncoder):
@@ -133,6 +133,10 @@ class Relationship(BaseModel):
             return self.id == other.id
         return False
 
+    @field_serializer("source", "target")
+    def serialize_node(self, node: Node):
+        return node.id
+
 
 @dataclass
 class KnowledgeGraph:
@@ -173,7 +177,18 @@ class KnowledgeGraph:
         self.relationships.append(relationship)
 
     def save(self, path: t.Union[str, Path]):
-        """Saves the knowledge graph to a JSON file."""
+        """Saves the knowledge graph to a JSON file.
+
+        Parameters
+        ----------
+        path : Union[str, Path]
+            Path where the JSON file should be saved.
+
+        Notes
+        -----
+        The file is saved using UTF-8 encoding to ensure proper handling of Unicode characters
+        across different platforms.
+        """
         if isinstance(path, str):
             path = Path(path)
 
@@ -181,20 +196,48 @@ class KnowledgeGraph:
             "nodes": [node.model_dump() for node in self.nodes],
             "relationships": [rel.model_dump() for rel in self.relationships],
         }
-        with open(path, "w") as f:
+        with open(path, "w", encoding="utf-8") as f:
             json.dump(data, f, cls=UUIDEncoder, indent=2, ensure_ascii=False)
 
     @classmethod
     def load(cls, path: t.Union[str, Path]) -> "KnowledgeGraph":
-        """Loads a knowledge graph from a path."""
+        """Loads a knowledge graph from a path.
+
+        Parameters
+        ----------
+        path : Union[str, Path]
+            Path to the JSON file containing the knowledge graph.
+
+        Returns
+        -------
+        KnowledgeGraph
+            The loaded knowledge graph.
+
+        Notes
+        -----
+        The file is read using UTF-8 encoding to ensure proper handling of Unicode characters
+        across different platforms.
+        """
         if isinstance(path, str):
             path = Path(path)
 
-        with open(path, "r") as f:
+        with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
 
         nodes = [Node(**node_data) for node_data in data["nodes"]]
-        relationships = [Relationship(**rel_data) for rel_data in data["relationships"]]
+
+        nodes_map = {str(node.id): node for node in nodes}
+        relationships = [
+            Relationship(
+                id=rel_data["id"],
+                type=rel_data["type"],
+                source=nodes_map[rel_data["source"]],
+                target=nodes_map[rel_data["target"]],
+                bidirectional=rel_data["bidirectional"],
+                properties=rel_data["properties"],
+            )
+            for rel_data in data["relationships"]
+        ]
 
         kg = cls()
         kg.nodes.extend(nodes)
@@ -316,12 +359,12 @@ class KnowledgeGraph:
             ]
             return new_graph
 
-    def find_direct_clusters(
+    def find_two_nodes_single_rel(
         self, relationship_condition: t.Callable[[Relationship], bool] = lambda _: True
-    ) -> t.Dict[Node, t.List[t.Set[Node]]]:
+    ) -> t.List[t.Tuple[Node, Relationship, Node]]:
         """
-        Finds direct clusters of nodes in the knowledge graph based on a relationship condition.
-        Here if A->B, and A->C, then A, B, and C form a cluster.
+        Finds nodes in the knowledge graph based on a relationship condition.
+        (NodeA, NodeB, Rel) triples are considered as multi-hop nodes.
 
         Parameters
         ----------
@@ -330,40 +373,34 @@ class KnowledgeGraph:
 
         Returns
         -------
-        List[Set[Node]]
-            A list of sets, where each set contains nodes that form a cluster.
+        List[Set[Node, Relationship, Node]]
+            A list of sets, where each set contains two nodes and a relationship forming a multi-hop node.
         """
 
-        clusters = []
         relationships = [
-            rel for rel in self.relationships if relationship_condition(rel)
+            relationship
+            for relationship in self.relationships
+            if relationship_condition(relationship)
         ]
-        for node in self.nodes:
-            cluster = set()
-            cluster.add(node)
-            for rel in relationships:
-                if rel.bidirectional:
-                    if rel.source == node:
-                        cluster.add(rel.target)
-                    elif rel.target == node:
-                        cluster.add(rel.source)
+
+        triplets = set()
+
+        for relationship in relationships:
+            if relationship.source != relationship.target:
+                node_a = relationship.source
+                node_b = relationship.target
+                # Ensure the smaller ID node is always first
+                if node_a.id < node_b.id:
+                    normalized_tuple = (node_a, relationship, node_b)
                 else:
-                    if rel.source == node:
-                        cluster.add(rel.target)
+                    normalized_relationship = Relationship(
+                        source=node_b,
+                        target=node_a,
+                        type=relationship.type,
+                        properties=relationship.properties,
+                    )
+                    normalized_tuple = (node_b, normalized_relationship, node_a)
 
-            if len(cluster) > 1:
-                if cluster not in clusters:
-                    clusters.append(cluster)
+                triplets.add(normalized_tuple)
 
-        # Remove subsets from clusters
-        unique_clusters = []
-        for cluster in clusters:
-            if not any(cluster < other for other in clusters):
-                unique_clusters.append(cluster)
-        clusters = unique_clusters
-
-        cluster_dict = {}
-        for cluster in clusters:
-            cluster_dict.update({cluster.pop(): cluster})
-
-        return cluster_dict
+        return list(triplets)

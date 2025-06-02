@@ -8,8 +8,14 @@ import numpy as np
 from pydantic import BaseModel
 
 from ragas.dataset_schema import SingleTurnSample
-from ragas.metrics._string import NonLLMStringSimilarity
-from ragas.metrics.base import MetricType, MetricWithLLM, SingleTurnMetric, ensembler
+from ragas.metrics._string import DistanceMeasure, NonLLMStringSimilarity
+from ragas.metrics.base import (
+    MetricOutputType,
+    MetricType,
+    MetricWithLLM,
+    SingleTurnMetric,
+    ensembler,
+)
 from ragas.prompt import PydanticPrompt
 from ragas.run_config import RunConfig
 from ragas.utils import deprecated
@@ -102,32 +108,11 @@ class LLMContextRecall(MetricWithLLM, SingleTurnMetric):
             }
         }
     )
+    output_type: t.Optional[MetricOutputType] = MetricOutputType.CONTINUOUS
     context_recall_prompt: PydanticPrompt = field(
         default_factory=ContextRecallClassificationPrompt
     )
     max_retries: int = 1
-    _reproducibility: int = 1
-
-    @property
-    def reproducibility(self):
-        return self._reproducibility
-
-    @reproducibility.setter
-    def reproducibility(self, value):
-        if value < 1:
-            logger.warning("reproducibility cannot be less than 1, setting to 1")
-            value = 1
-        elif value % 2 == 0:
-            logger.warning(
-                "reproducibility level cannot be set to even number, setting to odd"
-            )
-            value += 1
-        self._reproducibility = value
-
-    def __post_init__(self) -> None:
-        if self.reproducibility < 1:
-            logger.warning("reproducibility cannot be less than 1, setting to 1")
-            self.reproducibility = 1
 
     def _compute_score(self, responses: t.List[ContextRecallClassification]) -> float:
         response = [1 if item.attributed else 0 for item in responses]
@@ -159,7 +144,6 @@ class LLMContextRecall(MetricWithLLM, SingleTurnMetric):
                 ),
                 llm=self.llm,
                 callbacks=callbacks,
-                n=self.reproducibility,
             )
         )
         classification_dicts = []
@@ -202,18 +186,23 @@ class NonLLMContextRecall(SingleTurnMetric):
             }
         }
     )
-    distance_measure: SingleTurnMetric = field(
+    output_type: MetricOutputType = MetricOutputType.CONTINUOUS
+    _distance_measure: SingleTurnMetric = field(
         default_factory=lambda: NonLLMStringSimilarity()
     )
     threshold: float = 0.5
 
-    def __post_init__(self):
-        if isinstance(self.distance_measure, MetricWithLLM):
-            raise ValueError(
-                "distance_measure must not be an instance of MetricWithLLM for NonLLMContextPrecisionWithReference"
-            )
-
     def init(self, run_config: RunConfig) -> None: ...
+
+    @property
+    def distance_measure(self) -> SingleTurnMetric:
+        return self._distance_measure
+
+    @distance_measure.setter
+    def distance_measure(self, distance_measure: DistanceMeasure) -> None:
+        self._distance_measure = NonLLMStringSimilarity(
+            distance_measure=distance_measure
+        )
 
     async def _single_turn_ascore(
         self, sample: SingleTurnSample, callbacks: Callbacks

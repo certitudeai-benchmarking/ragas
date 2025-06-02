@@ -15,7 +15,11 @@ git clone https://huggingface.co/datasets/explodinggradients/Sample_Docs_Markdow
 
 ### Load documents
 
-Now we will load the documents from the sample dataset using `DirectoryLoader`, which is one of document loaders from [langchain_community](https://python.langchain.com/v0.1/docs/modules/data_connection/document_loaders/). You may also use any loaders from [llama_index](https://docs.llamaindex.ai/en/stable/understanding/loading/llamahub/)
+Now we will load the documents from the sample dataset using `DirectoryLoader`, which is one of the document loaders from [langchain_community](https://python.langchain.com/docs/concepts/document_loaders/). You may also use any loaders from [llama_index](https://docs.llamaindex.ai/en/stable/understanding/loading/llamahub/)
+
+```shell
+pip install langchain-community
+```
 
 ```python
 from langchain_community.document_loaders import DirectoryLoader
@@ -27,7 +31,7 @@ docs = loader.load()
 
 ### Choose your LLM
 
-You may choose to use any [LLM of your choice](../howtos/customizations/customize_models.md)
+You may choose to use any [LLM of your choice](./../howtos/customizations/customize_models.md)
 --8<--
 choose_generator_llm.md
 --8<--
@@ -43,16 +47,19 @@ generator = TestsetGenerator(llm=generator_llm, embedding_model=generator_embedd
 dataset = generator.generate_with_langchain_docs(docs, testset_size=10)
 ```
 
-### Export
+### Analyzing the testset
 
-You may now export and inspect the generated testset.
+Once you have generated a testset, you would want to view it and select the queries you see fit to include in your final testset. You can export the testset to a pandas dataframe and do various analysis on it.
 
 ```python
 dataset.to_pandas()
 ```
 
+Output
 ![testset](./testset_output.png)
 
+!!! note
+Generating synthetic test data can be confusing and hard, but if you need we are happy to help you with it. We have built pipelines to generate test data for various use cases. If you need help with it, please talk to us by booking a [slot](https://bit.ly/3EBYq4J) or drop us a line: [founders@explodinggradients.com](mailto:founders@explodinggradients.com).
 
 ## A Deeper Look
 
@@ -74,6 +81,7 @@ from ragas.testset.graph import KnowledgeGraph
 
 kg = KnowledgeGraph()
 ```
+Output
 ```
 KnowledgeGraph(nodes: 0, relationships: 0)
 ```
@@ -91,6 +99,7 @@ for doc in docs:
         )
     )
 ```
+Output
 ```
 KnowledgeGraph(nodes: 10, relationships: 0)
 ```
@@ -107,7 +116,7 @@ from ragas.testset.transforms import default_transforms, apply_transforms
 transformer_llm = generator_llm
 embedding_model = generator_embeddings
 
-trans = default_transforms(llm=transformer_llm, embedding_model=embedding_model)
+trans = default_transforms(documents=docs, llm=transformer_llm, embedding_model=embedding_model)
 apply_transforms(kg, trans)
 ```
 
@@ -118,6 +127,8 @@ kg.save("knowledge_graph.json")
 loaded_kg = KnowledgeGraph.load("knowledge_graph.json")
 loaded_kg
 ```
+
+Output
 ```
 KnowledgeGraph(nodes: 48, relationships: 605)
 ```
@@ -129,7 +140,7 @@ Now we will use the `loaded_kg` to create the [TestsetGenerator][ragas.testset.s
 ```python
 from ragas.testset import TestsetGenerator
 
-generator = TestsetGenerator(llm=generator_llm, knowledge_graph=loaded_kg)
+generator = TestsetGenerator(llm=generator_llm, embedding_model=embedding_model, knowledge_graph=loaded_kg)
 ```
 
 We can also define the distribution of queries we would like to generate. Here lets use the default distribution.
@@ -139,11 +150,13 @@ from ragas.testset.synthesizers import default_query_distribution
 
 query_distribution = default_query_distribution(generator_llm)
 ```
+
+Output
 ```
 [
-        (SingleHopSpecificQuerySynthesizer(llm=llm), 0.5),
-        (MultiHopAbstractQuerySynthesizer(llm=llm), 0.25),
-        (MultiHopSpecificQuerySynthesizer(llm=llm), 0.25),
+    (SingleHopSpecificQuerySynthesizer(llm=llm), 0.5),
+    (MultiHopAbstractQuerySynthesizer(llm=llm), 0.25),
+    (MultiHopSpecificQuerySynthesizer(llm=llm), 0.25),
 ]
 ```
 
@@ -153,5 +166,5 @@ Now we can generate the testset.
 testset = generator.generate(testset_size=10, query_distribution=query_distribution)
 testset.to_pandas()
 ```
-
+Output
 ![testset](./testset_output.png)

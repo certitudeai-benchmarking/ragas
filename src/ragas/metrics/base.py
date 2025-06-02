@@ -8,20 +8,25 @@ from collections import Counter
 from dataclasses import dataclass, field
 from enum import Enum
 
-from pysbd import Segmenter
+from pydantic import ValidationError
+from tqdm import tqdm
 
+from ragas._analytics import EvaluationEvent, _analytics_batcher
 from ragas.callbacks import ChainType, new_group
-from ragas.dataset_schema import MultiTurnSample, SingleTurnSample
+from ragas.dataset_schema import MetricAnnotation, MultiTurnSample, SingleTurnSample
 from ragas.executor import is_event_loop_running
-from ragas.prompt import PromptMixin
+from ragas.losses import BinaryMetricLoss, MSELoss
+from ragas.prompt import FewShotPydanticPrompt, PromptMixin
 from ragas.run_config import RunConfig
-from ragas.utils import RAGAS_SUPPORTED_LANGUAGE_CODES, camel_to_snake, deprecated
+from ragas.utils import camel_to_snake, deprecated, get_metric_language
 
 if t.TYPE_CHECKING:
     from langchain_core.callbacks import Callbacks
 
+    from ragas.config import DemonstrationConfig, InstructionConfig
     from ragas.embeddings import BaseRagasEmbeddings
     from ragas.llms import BaseRagasLLM
+
 logger = logging.getLogger(__name__)
 
 
@@ -49,6 +54,13 @@ class MetricType(Enum):
 
     SINGLE_TURN = "single_turn"
     MULTI_TURN = "multi_turn"
+
+
+class MetricOutputType(Enum):
+    BINARY = "binary"
+    DISCRETE = "discrete"
+    CONTINUOUS = "continuous"
+    RANKING = "ranking"
 
 
 @dataclass
@@ -83,13 +95,16 @@ class Metric(ABC):
         return required_columns
 
     @required_columns.setter
-    def required_columns(self, metric_type: MetricType, columns: t.Set[str]):
-        for column in columns:
-            if column not in VALID_COLUMNS:
-                raise ValueError(
-                    f"Invalid column '{column}'. Must be one of {VALID_COLUMNS}"
-                )
-        self._required_columns[metric_type] = columns
+    def required_columns(self, required_columns: t.Dict[MetricType, t.Set[str]]):
+        rc = {}
+        for metric_type, columns in required_columns.items():
+            for column in columns:
+                if column not in VALID_COLUMNS:
+                    raise ValueError(
+                        f"Invalid column '{column}'. Must be one of {VALID_COLUMNS}"
+                    )
+            rc[metric_type] = columns
+        self._required_columns = rc
 
     def get_required_columns(
         self, with_optional: bool = False
@@ -202,6 +217,7 @@ class MetricWithLLM(Metric, PromptMixin):
     """
 
     llm: t.Optional[BaseRagasLLM] = None
+    output_type: t.Optional[MetricOutputType] = None
 
     def init(self, run_config: RunConfig):
         if self.llm is None:
@@ -209,6 +225,205 @@ class MetricWithLLM(Metric, PromptMixin):
                 f"Metric '{self.name}' has no valid LLM provided (self.llm is None). Please initantiate a the metric with an LLM to run."  # noqa
             )
         self.llm.set_run_config(run_config)
+
+    def _optimize_instruction(
+        self,
+        instruction_config: InstructionConfig,
+        dataset: MetricAnnotation,
+        callbacks: Callbacks,
+        run_config: RunConfig,
+        batch_size: t.Optional[int],
+        with_debugging_logs: bool,
+        raise_exceptions: bool,
+    ):
+        if self.llm is None:
+            raise ValueError(
+                f"Metric '{self.name}' has no valid LLM provided (self.llm is None). Please initantiate a the metric with an LLM to run."  # noqa
+            )
+        optimizer = instruction_config.optimizer
+        if optimizer.llm is None:
+            optimizer.llm = instruction_config.llm
+
+        # figure out the loss function
+        if instruction_config.loss is None:
+            if self.output_type is None:
+                raise ValueError(
+                    f"Output type for metric '{self.name}' is not defined. Please set the output type in the metric or in the instruction config."
+                )
+            if self.output_type.name == MetricOutputType.BINARY.name:
+                loss_fun = BinaryMetricLoss()
+            elif (
+                self.output_type.name == MetricOutputType.CONTINUOUS.name
+                or self.output_type.name == MetricOutputType.DISCRETE.name
+            ):
+                loss_fun = MSELoss()
+            else:
+                raise NotImplementedError(
+                    f"Output type '{self.output_type.name}' not implemented"
+                )
+        else:
+            loss_fun = instruction_config.loss
+
+        # Optimize the prompts
+        optimizer.metric = self
+        optimizer_config = instruction_config.optimizer_config or {}
+        optimized_prompts = optimizer.optimize(
+            dataset[self.name],
+            loss_fun,
+            optimizer_config,
+            callbacks=callbacks,
+            run_config=run_config,
+            batch_size=batch_size,
+            with_debugging_logs=with_debugging_logs,
+            raise_exceptions=raise_exceptions,
+        )
+
+        # replace the instruction in the metric with the optimized instruction
+        prompts = self.get_prompts()
+        for key, val in optimized_prompts.items():
+            prompts[key].instruction = val
+        self.set_prompts(**prompts)
+
+    def _optimize_demonstration(
+        self, demonstration_config: DemonstrationConfig, dataset: MetricAnnotation
+    ):
+        # get the prompt annotations for this metric
+        prompt_annotations = dataset[self.name].get_prompt_annotations()
+        prompts = self.get_prompts()
+        for prompt_name, prompt_annotation_list in prompt_annotations.items():
+            # create a new FewShotPydanticPrompt with these annotations
+            if prompt_name not in prompts:
+                raise ValueError(
+                    f"Prompt '{prompt_name}' not found in metric '{self.name}'. Please check the prompt names in the annotation dataset."
+                )
+            pydantic_prompt = prompts[prompt_name]
+            input_model, output_model = (
+                pydantic_prompt.input_model,
+                pydantic_prompt.output_model,
+            )
+            # convert annotations into examples
+            input_examples, output_examples = [], []
+            for i, prompt_annotation in enumerate(prompt_annotation_list):
+                try:
+                    input_examples.append(
+                        input_model.model_validate(prompt_annotation.prompt_input)
+                    )
+                    # use the edited output if it is provided
+                    if prompt_annotation.edited_output is not None:
+                        output_examples.append(
+                            output_model.model_validate(prompt_annotation.edited_output)
+                        )
+                    else:
+                        output_examples.append(
+                            output_model.model_validate(prompt_annotation.prompt_output)
+                        )
+                except ValidationError as e:
+                    logger.warning(
+                        f"Skipping prompt '{prompt_name}' example {i} because of validation error: {e}"
+                    )
+                    continue
+            embedding_model = demonstration_config.embedding
+            few_shot_prompt = FewShotPydanticPrompt.from_pydantic_prompt(
+                pydantic_prompt=pydantic_prompt,
+                embeddings=embedding_model,
+            )
+
+            # add the top k examples to the few shot prompt
+            few_shot_prompt.top_k_for_examples = demonstration_config.top_k
+            few_shot_prompt.threshold_for_examples = demonstration_config.threshold
+
+            # add examples to the few shot prompt
+            for input_example, output_example in tqdm(
+                zip(input_examples, output_examples),
+                total=len(input_examples),
+                desc=f"Few-shot examples [{prompt_name}]",
+            ):
+                few_shot_prompt.add_example(input_example, output_example)
+            prompts[prompt_name] = few_shot_prompt
+        self.set_prompts(**prompts)
+
+    def train(
+        self,
+        path: t.Optional[str] = None,
+        run_id: t.Optional[str] = None,
+        demonstration_config: t.Optional[DemonstrationConfig] = None,
+        instruction_config: t.Optional[InstructionConfig] = None,
+        callbacks: t.Optional[Callbacks] = None,
+        run_config: t.Optional[RunConfig] = None,
+        batch_size: t.Optional[int] = None,
+        with_debugging_logs=False,
+        raise_exceptions: bool = True,
+    ) -> None:
+        """
+        Train the metric using local JSON data or annotations from Ragas platform
+
+        Parameters
+        ----------
+        path : str, optional
+            Path to local JSON training data file
+        run_id : str, optional
+            Direct run ID to fetch annotations
+        demonstration_config : DemonstrationConfig, optional
+            Configuration for demonstration optimization
+        instruction_config : InstructionConfig, optional
+            Configuration for instruction optimization
+        callbacks : Callbacks, optional
+            List of callback functions
+        run_config : RunConfig, optional
+            Run configuration
+        batch_size : int, optional
+            Batch size for training
+        with_debugging_logs : bool, default=False
+            Enable debugging logs
+        raise_exceptions : bool, default=True
+            Whether to raise exceptions during training
+
+        Raises
+        ------
+        ValueError
+            If invalid combination of path, and run_id is provided
+        """
+        # Validate input parameters
+        provided_inputs = sum(x is not None for x in [path, run_id])
+        if provided_inputs == 0:
+            raise ValueError("One of path or run_id must be provided")
+        if provided_inputs > 1:
+            raise ValueError("Only one of path or run_id should be provided")
+
+        run_config = run_config or RunConfig()
+        callbacks = callbacks or []
+
+        # Load the dataset based on input type
+        if path is not None:
+            if not path.endswith(".json"):
+                raise ValueError("Train data must be in json format")
+            dataset = MetricAnnotation.from_json(path, metric_name=self.name)
+        elif run_id is not None:
+            dataset = MetricAnnotation.from_app(
+                run_id=run_id,
+                metric_name=self.name,
+            )
+        else:
+            raise ValueError("One of path or run_id must be provided")
+
+        # only optimize the instruction if instruction_config is provided
+        if instruction_config is not None:
+            self._optimize_instruction(
+                instruction_config=instruction_config,
+                dataset=dataset,
+                callbacks=callbacks,
+                run_config=run_config,
+                batch_size=batch_size,
+                with_debugging_logs=with_debugging_logs,
+                raise_exceptions=raise_exceptions,
+            )
+
+        # if demonstration_config is provided, optimize the demonstrations
+        if demonstration_config is not None:
+            self._optimize_demonstration(
+                demonstration_config=demonstration_config,
+                dataset=dataset,
+            )
 
 
 @dataclass
@@ -283,6 +498,16 @@ class SingleTurnMetric(Metric):
         else:
             if not group_cm.ended:
                 rm.on_chain_end({"output": score})
+
+        # track the evaluation event
+        _analytics_batcher.add_evaluation(
+            EvaluationEvent(
+                metrics=[self.name],
+                num_rows=1,
+                evaluation_type=MetricType.SINGLE_TURN.name,
+                language=get_metric_language(self),
+            )
+        )
         return score
 
     async def single_turn_ascore(
@@ -317,6 +542,16 @@ class SingleTurnMetric(Metric):
         else:
             if not group_cm.ended:
                 rm.on_chain_end({"output": score})
+
+        # track the evaluation event
+        _analytics_batcher.add_evaluation(
+            EvaluationEvent(
+                metrics=[self.name],
+                num_rows=1,
+                evaluation_type=MetricType.SINGLE_TURN.name,
+                language=get_metric_language(self),
+            )
+        )
         return score
 
     @abstractmethod
@@ -391,6 +626,16 @@ class MultiTurnMetric(Metric):
         else:
             if not group_cm.ended:
                 rm.on_chain_end({"output": score})
+
+        # track the evaluation event
+        _analytics_batcher.add_evaluation(
+            EvaluationEvent(
+                metrics=[self.name],
+                num_rows=1,
+                evaluation_type=MetricType.SINGLE_TURN.name,
+                language=get_metric_language(self),
+            )
+        )
         return score
 
     async def multi_turn_ascore(
@@ -425,6 +670,17 @@ class MultiTurnMetric(Metric):
         else:
             if not group_cm.ended:
                 rm.on_chain_end({"output": score})
+
+        # track the evaluation event
+        _analytics_batcher.add_evaluation(
+            EvaluationEvent(
+                metrics=[self.name],
+                num_rows=1,
+                evaluation_type=MetricType.SINGLE_TURN.name,
+                language=get_metric_language(self),
+            )
+        )
+
         return score
 
     @abstractmethod
@@ -477,29 +733,10 @@ class Ensember:
         return verdict_agg
 
 
-def get_segmenter(
-    language: str = "english", clean: bool = False, char_span: bool = False
-):
-    """
-    Get a sentence segmenter for a given language
-    """
-    language = language.lower()
-    if language not in RAGAS_SUPPORTED_LANGUAGE_CODES:
-        raise ValueError(
-            f"Language '{language}' not supported. Supported languages: {RAGAS_SUPPORTED_LANGUAGE_CODES.keys()}"
-        )
-    return Segmenter(
-        language=RAGAS_SUPPORTED_LANGUAGE_CODES[language],
-        clean=clean,
-        char_span=char_span,
-    )
-
-
-def is_reproducable(metric: Metric) -> bool:
-    """
-    Check if a metric is reproducible by checking if it has a `_reproducibility` attribute.
-    """
-    return hasattr(metric, "_reproducibility")
+@t.runtime_checkable
+class ModeMetric(t.Protocol):
+    name: str
+    mode: str
 
 
 ensembler = Ensember()

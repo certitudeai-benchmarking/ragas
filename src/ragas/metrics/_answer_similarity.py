@@ -9,6 +9,7 @@ import numpy as np
 from ragas.dataset_schema import SingleTurnSample
 from ragas.embeddings.base import HuggingfaceEmbeddings
 from ragas.metrics.base import (
+    MetricOutputType,
     MetricType,
     MetricWithEmbeddings,
     SingleTurnMetric,
@@ -45,6 +46,7 @@ class SemanticSimilarity(MetricWithEmbeddings, SingleTurnMetric):
     _required_columns: t.Dict[MetricType, t.Set[str]] = field(
         default_factory=lambda: {MetricType.SINGLE_TURN: {"reference", "response"}}
     )
+    output_type = MetricOutputType.CONTINUOUS
     is_cross_encoder: bool = False
     threshold: t.Optional[float] = None
 
@@ -63,7 +65,9 @@ class SemanticSimilarity(MetricWithEmbeddings, SingleTurnMetric):
         return await self._ascore(row, callbacks)
 
     async def _ascore(self, row: t.Dict, callbacks: Callbacks) -> float:
-        assert self.embeddings is not None, "embeddings must be set"
+        assert (
+            self.embeddings is not None
+        ), f"Error: '{self.name}' requires embeddings to be set."
 
         ground_truth = t.cast(str, row["reference"])
         answer = t.cast(str, row["response"])
@@ -91,7 +95,7 @@ class SemanticSimilarity(MetricWithEmbeddings, SingleTurnMetric):
         if self.threshold:
             score = score >= self.threshold
 
-        return score.tolist()[0]
+        return float(score.item())
 
 
 class AnswerSimilarity(SemanticSimilarity):

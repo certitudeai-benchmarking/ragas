@@ -20,7 +20,7 @@
         <img alt="Open In Colab" src="https://img.shields.io/pypi/dm/ragas">
     </a>
     <a href="https://discord.gg/5djav8GGNZ">
-        <img alt="discord-invite" src="https://dcbadge.vercel.app/api/server/5djav8GGNZ?style=flat">
+        <img alt="discord-invite" src="https://img.shields.io/discord/1119637219561451644">
     </a>
 </p>
 
@@ -29,6 +29,7 @@
         <a href="https://docs.ragas.io/">Documentation</a> |
         <a href="#fire-quickstart">Quick start</a> |
         <a href="https://discord.gg/5djav8GGNZ">Join Discord</a> |
+        <a href="https://blog.ragas.io/">Blog</a> |
         <a href="https://newsletter.ragas.io/">NewsLetter</a> |
         <a href="https://www.ragas.io/careers">Careers</a>
     <p>
@@ -38,6 +39,9 @@ Objective metrics, intelligent test generation, and data-driven insights for LLM
 
 Ragas is your ultimate toolkit for evaluating and optimizing Large Language Model (LLM) applications. Say goodbye to time-consuming, subjective assessments and hello to data-driven, efficient evaluation workflows.
 Don't have a test dataset ready? We also do production-aligned test set generation.
+
+> [!NOTE]
+> Need help setting up Evals for your AI application? We'd love to help! We are conducting Office Hours every week. You can sign up [here](https://cal.com/team/ragas/office-hours).
 
 ## Key Features
 
@@ -62,37 +66,40 @@ pip install git+https://github.com/explodinggradients/ragas
 
 ## :fire: Quickstart
 
-### Evaluate your RAG with Ragas metrics
+### Evaluate your LLM App
 
-This is 4 main lines:
+This is 5 main lines:
 
 ```python
-from ragas.metrics import LLMContextRecall, Faithfulness, FactualCorrectness
-from langchain_openai.chat_models import ChatOpenAI
-from ragas.llms import LangchainLLMWrapper
+from ragas import SingleTurnSample
+from ragas.metrics import AspectCritic
 
+test_data = {
+    "user_input": "summarise given text\nThe company reported an 8% rise in Q3 2024, driven by strong performance in the Asian market. Sales in this region have significantly contributed to the overall growth. Analysts attribute this success to strategic marketing and product localization. The positive trend in the Asian market is expected to continue into the next quarter.",
+    "response": "The company experienced an 8% increase in Q3 2024, largely due to effective marketing strategies and product adaptation, with expectations of continued growth in the coming quarter.",
+}
 evaluator_llm = LangchainLLMWrapper(ChatOpenAI(model="gpt-4o"))
-metrics = [LLMContextRecall(), FactualCorrectness(), Faithfulness()]
-results = evaluate(dataset=eval_dataset, metrics=metrics, llm=evaluator_llm)
+metric = AspectCritic(name="summary_accuracy",llm=evaluator_llm, definition="Verify if the summary is accurate.")
+await metric.single_turn_ascore(SingleTurnSample(**test_data))
 ```
 
-Find the complete RAG Evaluation Quickstart here: [https://docs.ragas.io/en/latest/getstarted/rag_evaluation/](https://docs.ragas.io/en/latest/getstarted/rag_evaluation/)
+Find the complete [Quickstart Guide](https://docs.ragas.io/en/latest/getstarted/evals)
 
-<details>
-<summary>🖱️Click to see preview of RESULTS</summary>
+## Want help in improving your AI application using evals?
 
-| user_input | retrieved_contexts | response | reference | context_recall | factual_correctness | faithfulness |
-|------------|---------------------|----------|-----------|-----------------|---------------------|---------------|
-| What are the global implications of the USA Supreme Court ruling on abortion? | "- In 2022, the USA Supreme Court ... - The ruling has created a chilling effect ..." | The global implications ... Here are some potential implications: | The global implications ... Additionally, the ruling has had an impact beyond national borders ... | 1 | 0.47 | 0.516129 |
-| Which companies are the main contributors to GHG emissions ... ? | "- Fossil fuel companies ... - Between 2010 and 2020, human mortality ..." | According to the Carbon Majors database ... Here are the top contributors: | According to the Carbon Majors database ... Additionally, between 2010 and 2020, human mortality ... | 1 | 0.11 | 0.172414 |
-| Which private companies in the Americas are the largest GHG emitters ... ? | "The private companies responsible ... The largest emitter amongst state-owned companies ..." | According to the Carbon Majors database, the largest private companies ... | The largest private companies in the Americas ... | 1 | 0.26 | 0 |
-</details>
+In the past 2 years, we have seen and helped improve many AI applications using evals. 
 
-### Generate a test dataset for comprehensive RAG evaluation
+We are compressing this knowledge into a product to replace vibe checks with eval loops so that you can focus on building great AI applications. 
 
-What if you don't have the data for folks asking questions when they interact with your RAG system? 
+If you want help with improving and scaling up your AI application using evals.
 
-Ragas can help by generating [synthetic test set generation](https://docs.ragas.io/en/latest/getstarted/rag_testset_generation/) -- where you can seed it with your data and control the difficulty, variety, and complexity. 
+
+🔗 Book a [slot](https://bit.ly/3EBYq4J) or drop us a line: [founders@explodinggradients.com](mailto:founders@explodinggradients.com).
+
+
+![](/docs/_static/ragas_app.gif)
+
+
 
 ## 🫂 Community
 
@@ -131,3 +138,13 @@ At Ragas, we believe in transparency. We collect minimal, anonymized usage data 
 ✅ Publicly available aggregated [data](https://github.com/explodinggradients/ragas/issues/49)
 
 To opt-out, set the `RAGAS_DO_NOT_TRACK` environment variable to `true`.
+
+### Cite Us
+```
+@misc{ragas2024,
+  author       = {ExplodingGradients},
+  title        = {Ragas: Supercharge Your LLM Application Evaluations},
+  year         = {2024},
+  howpublished = {\url{https://github.com/explodinggradients/ragas}},
+}
+```

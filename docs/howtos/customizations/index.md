@@ -12,9 +12,12 @@ How to customize various aspects of Ragas to suit your needs.
 - [Write your own metrics](./metrics/_write_your_own_metric.md)
 - [Adapt metrics to target language](./metrics/_metrics_language_adaptation.md)
 - [Trace evaluations with Observability tools](metrics/tracing.md)
+- [Train and align metric](./metrics/train_your_own_metric.md)
 
 
 ## Testset Generation
-
-- [Add your own test cases](testgenerator/index.md)
+- [Generate test data from non-english corpus](testgenerator/_language_adaptation.md)
+- [Configure or automatically generate Personas](testgenerator/_persona_generator.md)
+- [Customize single-hop queries for RAG evaluation](testgenerator/_testgen-custom-single-hop.md)
+- [Create custom multi-hop queries for RAG evaluation](testgenerator/_testgen-customisation.md)
 - [Seed generations using production data](testgenerator/index.md)

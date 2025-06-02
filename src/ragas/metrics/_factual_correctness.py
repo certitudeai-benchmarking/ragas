@@ -9,16 +9,12 @@ import numpy as np
 from numpy.typing import NDArray
 from pydantic import BaseModel, Field
 
-from ragas.metrics._faithfulness import (
-    HasSegmentMethod,
-    NLIStatementInput,
-    NLIStatementPrompt,
-)
+from ragas.metrics._faithfulness import NLIStatementInput, NLIStatementPrompt
 from ragas.metrics.base import (
+    MetricOutputType,
     MetricType,
     MetricWithLLM,
     SingleTurnMetric,
-    get_segmenter,
 )
 from ragas.metrics.utils import fbeta_score
 from ragas.prompt import PydanticPrompt
@@ -34,11 +30,10 @@ logger = logging.getLogger(__name__)
 
 class ClaimDecompositionInput(BaseModel):
     response: str = Field(..., title="Response")
-    sentences: t.List[str] = Field(..., title="Sentences from response")
 
 
 class ClaimDecompositionOutput(BaseModel):
-    decomposed_claims: t.List[t.List[str]] = Field(..., title="Decomposed Claims")
+    claims: t.List[str] = Field(..., title="Decomposed Claims")
 
 
 # Define an enum for decomposition types
@@ -51,21 +46,16 @@ class DecompositionType(Enum):
 
 # Example input data
 example1_input = ClaimDecompositionInput(
-    response="Charles Babbage was a French mathematician, philosopher, and food critic.",
-    sentences=[
-        "Charles Babbage was a French mathematician, philosopher, and food critic."
-    ],
+    response="Charles Babbage was a French mathematician, philosopher, and food critic."
 )
 
-# Define the examples using the new structure
+# Define the examples using the Pydantic structure
 claim_decomposition_examples = {
     DecompositionType.LOW_ATOMICITY_LOW_COVERAGE: [
         (
             example1_input,
             ClaimDecompositionOutput(
-                decomposed_claims=[
-                    ["Charles Babbage was a mathematician and philosopher."]
-                ]
+                claims=["Charles Babbage was a mathematician and philosopher."]
             ),
         )
     ],
@@ -73,10 +63,8 @@ claim_decomposition_examples = {
         (
             example1_input,
             ClaimDecompositionOutput(
-                decomposed_claims=[
-                    [
-                        "Charles Babbage was a French mathematician, philosopher, and food critic."
-                    ]
+                claims=[
+                    "Charles Babbage was a French mathematician, philosopher, and food critic."
                 ]
             ),
         )
@@ -85,9 +73,9 @@ claim_decomposition_examples = {
         (
             example1_input,
             ClaimDecompositionOutput(
-                decomposed_claims=[
-                    ["Charles Babbage was a mathematician."],
-                    ["Charles Babbage was a philosopher."],
+                claims=[
+                    "Charles Babbage was a mathematician.",
+                    "Charles Babbage was a philosopher.",
                 ]
             ),
         )
@@ -96,11 +84,11 @@ claim_decomposition_examples = {
         (
             example1_input,
             ClaimDecompositionOutput(
-                decomposed_claims=[
-                    ["Charles Babbage was a mathematician."],
-                    ["Charles Babbage was a philosopher."],
-                    ["Charles Babbage was a food critic."],
-                    ["Charles Babbage was French."],
+                claims=[
+                    "Charles Babbage was a mathematician.",
+                    "Charles Babbage was a philosopher.",
+                    "Charles Babbage was a food critic.",
+                    "Charles Babbage was French.",
                 ]
             ),
         )
@@ -109,11 +97,7 @@ claim_decomposition_examples = {
 
 # Example input data with two sentences
 example2_input = ClaimDecompositionInput(
-    response="Albert Einstein was a German theoretical physicist. He developed the theory of relativity and also contributed to the development of quantum mechanics.",
-    sentences=[
-        "Albert Einstein was a German theoretical physicist.",
-        "He developed the theory of relativity and also contributed to the development of quantum mechanics.",
-    ],
+    response="Albert Einstein was a German theoretical physicist. He developed the theory of relativity and also contributed to the development of quantum mechanics."
 )
 
 # Adding examples to the dictionary with different decomposition types
@@ -121,11 +105,9 @@ claim_decomposition_examples[DecompositionType.LOW_ATOMICITY_LOW_COVERAGE].appen
     (
         example2_input,
         ClaimDecompositionOutput(
-            decomposed_claims=[
-                ["Albert Einstein was a German physicist."],
-                [
-                    "Albert Einstein developed relativity and contributed to quantum mechanics."
-                ],
+            claims=[
+                "Albert Einstein was a German physicist.",
+                "Albert Einstein developed relativity and contributed to quantum mechanics.",
             ]
         ),
     )
@@ -135,11 +117,9 @@ claim_decomposition_examples[DecompositionType.LOW_ATOMICITY_HIGH_COVERAGE].appe
     (
         example2_input,
         ClaimDecompositionOutput(
-            decomposed_claims=[
-                ["Albert Einstein was a German theoretical physicist."],
-                [
-                    "Albert Einstein developed the theory of relativity and also contributed to the development of quantum mechanics."
-                ],
+            claims=[
+                "Albert Einstein was a German theoretical physicist.",
+                "Albert Einstein developed the theory of relativity and also contributed to the development of quantum mechanics.",
             ]
         ),
     )
@@ -149,9 +129,9 @@ claim_decomposition_examples[DecompositionType.HIGH_ATOMICITY_LOW_COVERAGE].appe
     (
         example2_input,
         ClaimDecompositionOutput(
-            decomposed_claims=[
-                ["Albert Einstein was a German theoretical physicist."],
-                ["Albert Einstein developed the theory of relativity."],
+            claims=[
+                "Albert Einstein was a German theoretical physicist.",
+                "Albert Einstein developed the theory of relativity.",
             ]
         ),
     )
@@ -161,12 +141,10 @@ claim_decomposition_examples[DecompositionType.HIGH_ATOMICITY_HIGH_COVERAGE].app
     (
         example2_input,
         ClaimDecompositionOutput(
-            decomposed_claims=[
-                ["Albert Einstein was a German theoretical physicist."],
-                [
-                    "Albert Einstein developed the theory of relativity.",
-                    "Albert Einstein contributed to the development of quantum mechanics.",
-                ],
+            claims=[
+                "Albert Einstein was a German theoretical physicist.",
+                "Albert Einstein developed the theory of relativity.",
+                "Albert Einstein contributed to the development of quantum mechanics.",
             ]
         ),
     )
@@ -210,17 +188,25 @@ class FactualCorrectness(MetricWithLLM, SingleTurnMetric):
     _required_columns: t.Dict[MetricType, t.Set[str]] = field(
         default_factory=lambda: {MetricType.SINGLE_TURN: {"response", "reference"}}
     )
+    output_type: t.Optional[MetricOutputType] = MetricOutputType.CONTINUOUS
     mode: t.Literal["precision", "recall", "f1"] = "f1"
     beta: float = 1.0
     atomicity: t.Literal["low", "high"] = "low"
     coverage: t.Literal["low", "high"] = "low"
-    claim_decomposition_prompt: PydanticPrompt = ClaimDecompositionPrompt()
-    nli_prompt: PydanticPrompt = NLIStatementPrompt()
-    sentence_segmenter: t.Optional[HasSegmentMethod] = None
+    claim_decomposition_prompt: PydanticPrompt = field(
+        default_factory=ClaimDecompositionPrompt
+    )
+    nli_prompt: PydanticPrompt = field(default_factory=NLIStatementPrompt)
     language: str = "english"
 
     def __post_init__(self):
         value = f"{self.atomicity}_atomicity_{self.coverage}_coverage"
+
+        # This creates a new instance-specific examples list, isolating
+        # changes to just this instance and preventing cross-contamination
+        # with other metrics.
+        self.claim_decomposition_prompt.examples = []
+
         for item in DecompositionType:
             if item.value == value:
                 self.claim_decomposition_prompt.examples.extend(
@@ -230,8 +216,6 @@ class FactualCorrectness(MetricWithLLM, SingleTurnMetric):
             logger.warning(
                 f"No examples found for the atomicity and coverage level: {value}"
             )
-        if not self.sentence_segmenter:
-            self.sentence_segmenter = get_segmenter(language=self.language, clean=False)
 
         if type(self.beta) is not float:
             raise ValueError(
@@ -242,20 +226,12 @@ class FactualCorrectness(MetricWithLLM, SingleTurnMetric):
         self, response: str, callbacks: Callbacks
     ) -> t.List[str]:
         assert self.llm is not None, "LLM must be set"
-        assert (
-            self.sentence_segmenter is not None
-        ), "Sentence segmenter is not initialized"
 
-        sentences = self.sentence_segmenter.segment(response)
-        assert isinstance(sentences, list), "Segmenter must return a list of sentences"
-        prompt_input = ClaimDecompositionInput(response=response, sentences=sentences)
+        prompt_input = ClaimDecompositionInput(response=response)
         result = await self.claim_decomposition_prompt.generate(
             data=prompt_input, llm=self.llm, callbacks=callbacks
         )
-        claims_list = [
-            claim for claim_list in result.decomposed_claims for claim in claim_list
-        ]
-        return claims_list
+        return result.claims
 
     async def verify_claims(
         self, premise: str, hypothesis_list: t.List[str], callbacks: Callbacks, saveresults_prefix=''
@@ -265,8 +241,14 @@ class FactualCorrectness(MetricWithLLM, SingleTurnMetric):
         response = await self.nli_prompt.generate(
             data=prompt_input, llm=self.llm, callbacks=callbacks
         )
-        self.intermediate_results[saveresults_prefix + 'nliresponse'] = response
-        return np.array([bool(result.verdict) for result in response.statements])
+        if response.statements:
+            claim_verifications = np.array(
+                [bool(result.verdict) for result in response.statements]
+            )
+        else:
+            claim_verifications = np.array([], dtype=bool)
+        self.intermediate_results['claim_verifications'] = claim_verifications
+        return claim_verifications
 
     async def _single_turn_ascore(
         self, sample: SingleTurnSample, callbacks: Callbacks
@@ -296,7 +278,7 @@ class FactualCorrectness(MetricWithLLM, SingleTurnMetric):
             )
             self.intermediate_results["recall_verdicts"] = response_reference
         else:
-            response_reference = np.array([])
+            response_reference = np.array([], dtype=bool)
             self.intermediate_results['recall_verdicts'] = response_reference
 
         tp = sum(reference_response)

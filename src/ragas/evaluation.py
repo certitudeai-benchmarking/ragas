@@ -1,14 +1,15 @@
 from __future__ import annotations
 
 import typing as t
+from uuid import UUID
 
-import numpy as np
 from datasets import Dataset
 from langchain_core.callbacks import BaseCallbackHandler, BaseCallbackManager
 from langchain_core.embeddings import Embeddings as LangchainEmbeddings
 from langchain_core.language_models import BaseLanguageModel as LangchainLLM
+from tqdm.auto import tqdm
 
-from ragas._analytics import EvaluationEvent, track, track_was_completed
+from ragas._analytics import track_was_completed
 from ragas.callbacks import ChainType, RagasTracer, new_group
 from ragas.dataset_schema import (
     EvaluationDataset,
@@ -32,12 +33,12 @@ from ragas.metrics.base import (
     Metric,
     MetricWithEmbeddings,
     MetricWithLLM,
+    ModeMetric,
     MultiTurnMetric,
     SingleTurnMetric,
-    is_reproducable,
 )
 from ragas.run_config import RunConfig
-from ragas.utils import convert_v1_to_v2_dataset, get_feature_language
+from ragas.utils import convert_v1_to_v2_dataset
 from ragas.validation import (
     remap_column_names,
     validate_required_columns,
@@ -58,61 +59,56 @@ def evaluate(
     metrics: t.Optional[t.Sequence[Metric]] = None,
     llm: t.Optional[BaseRagasLLM | LangchainLLM] = None,
     embeddings: t.Optional[BaseRagasEmbeddings | LangchainEmbeddings] = None,
+    experiment_name: t.Optional[str] = None,
     callbacks: Callbacks = None,
-    in_ci: bool = False,
-    run_config: RunConfig = RunConfig(),
+    run_config: t.Optional[RunConfig] = None,
     token_usage_parser: t.Optional[TokenUsageParser] = None,
     raise_exceptions: bool = False,
     column_map: t.Optional[t.Dict[str, str]] = None,
     show_progress: bool = True,
     batch_size: t.Optional[int] = None,
+    _run_id: t.Optional[UUID] = None,
+    _pbar: t.Optional[tqdm] = None,
 ) -> EvaluationResult:
     """
-    Run the evaluation on the dataset with different metrics
+    Perform the evaluation on the dataset with different metrics
 
     Parameters
     ----------
     dataset : Dataset, EvaluationDataset
-        The dataset in the format of ragas which the metrics will use to score the RAG
-        pipeline with
-    metrics : list[Metric] , optional
-        List of metrics to use for evaluation. If not provided then ragas will run the
-        evaluation on the best set of metrics to give a complete view.
-    llm: BaseRagasLLM, optional
-        The language model to use for the metrics. If not provided then ragas will use
-        the default language model for metrics which require an LLM. This can we overridden by the llm specified in
-        the metric level with `metric.llm`.
-    embeddings: BaseRagasEmbeddings, optional
-        The embeddings to use for the metrics. If not provided then ragas will use
-        the default embeddings for metrics which require embeddings. This can we overridden by the embeddings specified in
-        the metric level with `metric.embeddings`.
-    callbacks: Callbacks, optional
-        Lifecycle Langchain Callbacks to run during evaluation. Check the
-        [langchain documentation](https://python.langchain.com/docs/modules/callbacks/)
-        for more information.
-    in_ci: bool
-        Whether the evaluation is running in CI or not. If set to True then some
-        metrics will be run to increase the reproducability of the evaluations. This
-        will increase the runtime and cost of evaluations. Default is False.
-    run_config: RunConfig, optional
-        Configuration for runtime settings like timeout and retries. If not provided,
-        default values are used.
-    token_usage_parser: TokenUsageParser, optional
-        Parser to get the token usage from the LLM result. If not provided then the
-        the cost and total tokens will not be calculated. Default is None.
-    raise_exceptions: False
-        Whether to raise exceptions or not. If set to True then the evaluation will
-        raise an exception if any of the metrics fail. If set to False then the
-        evaluation will return `np.nan` for the row that failed. Default is False.
+        The dataset used by the metrics to evaluate the RAG pipeline.
+    metrics : list[Metric], optional
+        List of metrics to use for evaluation. If not provided, ragas will run
+        the evaluation on the best set of metrics to give a complete view.
+    llm : BaseRagasLLM, optional
+        The language model (LLM) to use to generate the score for calculating the metrics.
+        If not provided, ragas will use the default
+        language model for metrics that require an LLM. This can be overridden by the LLM
+        specified in the metric level with `metric.llm`.
+    embeddings : BaseRagasEmbeddings, optional
+        The embeddings model to use for the metrics.
+        If not provided, ragas will use the default embeddings for metrics that require embeddings.
+        This can be overridden by the embeddings specified in the metric level with `metric.embeddings`.
+    experiment_name : str, optional
+        The name of the experiment to track. This is used to track the evaluation in the tracing tool.
+    callbacks : Callbacks, optional
+        Lifecycle Langchain Callbacks to run during evaluation.
+        Check the [Langchain documentation](https://python.langchain.com/docs/modules/callbacks/) for more information.
+    run_config : RunConfig, optional
+        Configuration for runtime settings like timeout and retries. If not provided, default values are used.
+    token_usage_parser : TokenUsageParser, optional
+        Parser to get the token usage from the LLM result.
+        If not provided, the cost and total token count will not be calculated. Default is None.
+    raise_exceptions : False
+        Whether to raise exceptions or not. If set to True, the evaluation will raise an exception
+        if any of the metrics fail. If set to False, the evaluation will return `np.nan` for the row that failed. Default is False.
     column_map : dict[str, str], optional
-        The column names of the dataset to use for evaluation. If the column names of
-        the dataset are different from the default ones then you can provide the
-        mapping as a dictionary here. Example: If the dataset column name is contexts_v1,
-        column_map can be given as {"contexts":"contexts_v1"}
-    show_progress: bool, optional
-        Whether to show the progress bar during evaluation. If set to False, the progress bar will be disabled. Default is True.
-    batch_size: int, optional
-        How large should batches be.  If set to None (default), no batching is done.
+        The column names of the dataset to use for evaluation. If the column names of the dataset are different from the default ones,
+        it is possible to provide the mapping as a dictionary here. Example: If the dataset column name is `contexts_v1`, it is possible to pass column_map as `{"contexts": "contexts_v1"}`.
+    show_progress : bool, optional
+        Whether to show the progress bar during evaluation. If set to False, the progress bar will be disabled. The default is True.
+    batch_size : int, optional
+        How large the batches should be. If set to None (default), no batching is done.
 
     Returns
     -------
@@ -147,6 +143,7 @@ def evaluate(
     """
     column_map = column_map or {}
     callbacks = callbacks or []
+    run_config = run_config or RunConfig()
 
     if helicone_config.is_enabled:
         import uuid
@@ -189,7 +186,6 @@ def evaluate(
     binary_metrics = []
     llm_changed: t.List[int] = []
     embeddings_changed: t.List[int] = []
-    reproducable_metrics: t.List[int] = []
     answer_correctness_is_set = -1
 
     # loop through the metrics and perform initializations
@@ -210,12 +206,6 @@ def evaluate(
         if isinstance(metric, AnswerCorrectness):
             if metric.answer_similarity is None:
                 answer_correctness_is_set = i
-        # set reproducibility for metrics if in CI
-        if in_ci and is_reproducable(metric):
-            if metric.reproducibility == 1:  # type: ignore
-                # only set a value if not already set
-                metric.reproducibility = 3  # type: ignore
-                reproducable_metrics.append(i)
 
         # init all the models
         metric.init(run_config)
@@ -227,6 +217,7 @@ def evaluate(
         run_config=run_config,
         show_progress=show_progress,
         batch_size=batch_size,
+        pbar=_pbar,
     )
 
     # Ragas Callbacks
@@ -254,7 +245,7 @@ def evaluate(
     # new evaluation chain
     row_run_managers = []
     evaluation_rm, evaluation_group_cm = new_group(
-        name=RAGAS_EVALUATION_CHAIN_NAME,
+        name=experiment_name or RAGAS_EVALUATION_CHAIN_NAME,
         inputs={},
         callbacks=callbacks,
         metadata={"type": ChainType.EVALUATION},
@@ -308,7 +299,11 @@ def evaluate(
         for i, _ in enumerate(dataset):
             s = {}
             for j, m in enumerate(metrics):
-                s[m.name] = results[len(metrics) * i + j]
+                if isinstance(m, ModeMetric):  # type: ignore
+                    key = f"{m.name}(mode={m.mode})"
+                else:
+                    key = m.name
+                s[key] = results[len(metrics) * i + j]
             scores.append(s)
             # close the row chain
             row_rm, row_group_cm = row_run_managers[i]
@@ -334,6 +329,7 @@ def evaluate(
                 cost_cb,
             ),
             ragas_traces=tracer.traces,
+            run_id=_run_id,
         )
         if not evaluation_group_cm.ended:
             evaluation_rm.on_chain_end({"scores": result.scores})
@@ -348,21 +344,9 @@ def evaluate(
                 AnswerCorrectness, metrics[answer_correctness_is_set]
             ).answer_similarity = None
 
-        for i in reproducable_metrics:
-            metrics[i].reproducibility = 1  # type: ignore
+        # flush the analytics batcher
+        from ragas._analytics import _analytics_batcher
 
-    # log the evaluation event
-    metrics_names = [m.name for m in metrics]
-    metric_lang = [get_feature_language(m) for m in metrics]
-    metric_lang = np.unique([m for m in metric_lang if m is not None])
-    track(
-        EvaluationEvent(
-            event_type="evaluation",
-            metrics=metrics_names,
-            evaluation_mode="",
-            num_rows=len(dataset),
-            language=metric_lang[0] if len(metric_lang) > 0 else "",
-            in_ci=in_ci,
-        )
-    )
+        _analytics_batcher.flush()
+
     return result

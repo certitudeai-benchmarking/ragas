@@ -289,7 +289,7 @@ ragas_trace = convert_to_ragas_messages(result["messages"])
 
 
 ```python
-ragas_trace # List of Ragas messages
+ragas_trace  # List of Ragas messages
 ```
 
 
@@ -335,7 +335,6 @@ sample = MultiTurnSample(
 )
 
 tool_accuracy_scorer = ToolCallAccuracy()
-tool_accuracy_scorer.llm = ChatOpenAI(model="gpt-4o-mini")
 await tool_accuracy_scorer.multi_turn_ascore(sample)
 ```
 

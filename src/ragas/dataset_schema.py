@@ -1,17 +1,33 @@
 from __future__ import annotations
 
 import json
+import random
 import typing as t
 from abc import ABC, abstractmethod
+from collections import defaultdict
 from dataclasses import dataclass, field
+from uuid import UUID
 
+import numpy as np
+import requests
 from datasets import Dataset as HFDataset
 from pydantic import BaseModel, field_validator
 
+from ragas._version import __version__
 from ragas.callbacks import ChainRunEncoder, parse_run_traces
 from ragas.cost import CostCallbackHandler
+from ragas.exceptions import UploadException
 from ragas.messages import AIMessage, HumanMessage, ToolCall, ToolMessage
-from ragas.utils import RAGAS_API_URL, safe_nanmean
+from ragas.sdk import (
+    RAGAS_API_SOURCE,
+    build_evaluation_app_url,
+    check_api_response,
+    get_api_url,
+    get_app_token,
+    get_app_url,
+    upload_packet,
+)
+from ragas.utils import safe_nanmean
 
 if t.TYPE_CHECKING:
     from pathlib import Path
@@ -39,6 +55,13 @@ class BaseSample(BaseModel):
         Get the features of the sample that are not None.
         """
         return list(self.to_dict().keys())
+
+    def to_string(self) -> str:
+        """
+        Get the string representation of the sample.
+        """
+        sample_dict = self.to_dict()
+        return "".join(f"\n{key}:\n\t{val}\n" for key, val in sample_dict.items())
 
 
 class SingleTurnSample(BaseSample):
@@ -69,7 +92,7 @@ class SingleTurnSample(BaseSample):
     response: t.Optional[str] = None
     multi_responses: t.Optional[t.List[str]] = None
     reference: t.Optional[str] = None
-    rubric: t.Optional[t.Dict[str, str]] = None
+    rubrics: t.Optional[t.Dict[str, str]] = None
 
 
 class MultiTurnSample(BaseSample):
@@ -110,18 +133,34 @@ class MultiTurnSample(BaseSample):
                 "All inputs must be instances of HumanMessage, AIMessage, or ToolMessage."
             )
 
-        prev_message = None
-        for m in messages:
-            if isinstance(m, ToolMessage):
-                if not isinstance(prev_message, AIMessage):
+        has_seen_ai_message = False
+
+        for i, m in enumerate(messages):
+            if isinstance(m, AIMessage):
+                has_seen_ai_message = True
+
+            elif isinstance(m, ToolMessage):
+                # Rule 1: ToolMessage must be preceded by an AIMessage somewhere in the conversation
+                if not has_seen_ai_message:
                     raise ValueError(
-                        "ToolMessage instances must be preceded by an AIMessage instance."
+                        "ToolMessage must be preceded by an AIMessage somewhere in the conversation."
                     )
-                if prev_message.tool_calls is None:
-                    raise ValueError(
-                        f"ToolMessage instances must be preceded by an AIMessage instance with tool_calls. Got {prev_message}"
-                    )
-            prev_message = m
+
+                # Rule 2: ToolMessage must follow an AIMessage or another ToolMessage
+                if i > 0:
+                    prev_message = messages[i - 1]
+
+                    if isinstance(prev_message, AIMessage):
+                        # Rule 3: If following AIMessage, that message must have tool_calls
+                        if not prev_message.tool_calls:
+                            raise ValueError(
+                                "ToolMessage must follow an AIMessage where tools were called."
+                            )
+                    elif not isinstance(prev_message, ToolMessage):
+                        # Not following AIMessage or ToolMessage
+                        raise ValueError(
+                            "ToolMessage must follow an AIMessage or another ToolMessage."
+                        )
 
         return messages
 
@@ -165,9 +204,12 @@ class RagasDataset(ABC, t.Generic[Sample]):
         if len(samples) == 0:
             return samples
 
-        first_sample_type = type(self.samples[0])
-        if not all(isinstance(sample, first_sample_type) for sample in self.samples):
-            raise ValueError("All samples must be of the same type")
+        first_sample_type = type(samples[0])
+        for i, sample in enumerate(samples):
+            if not isinstance(sample, first_sample_type):
+                raise ValueError(
+                    f"Sample at index {i} is of type {type(sample)}, expected {first_sample_type}"
+                )
 
         return samples
 
@@ -375,6 +417,7 @@ class EvaluationResult:
     cost_cb: t.Optional[CostCallbackHandler] = None
     traces: t.List[t.Dict[str, t.Any]] = field(default_factory=list)
     ragas_traces: t.Dict[str, ChainRun] = field(default_factory=dict, repr=False)
+    run_id: t.Optional[UUID] = None
 
     def __post_init__(self):
         # transform scores from list of dicts to dict of lists
@@ -392,7 +435,8 @@ class EvaluationResult:
                 values.append(value + 1e-10)
 
         # parse the traces
-        self.traces = parse_run_traces(self.ragas_traces)
+        run_id = str(self.run_id) if self.run_id is not None else None
+        self.traces = parse_run_traces(self.ragas_traces, run_id)
 
     def __repr__(self) -> str:
         score_strs = [f"'{k}': {v:0.4f}" for k, v in self._repr_dict.items()]
@@ -493,10 +537,11 @@ class EvaluationResult:
             cost_per_input_token, cost_per_output_token, per_model_costs
         )
 
-    def upload(self, base_url: str = RAGAS_API_URL, verbose: bool = True) -> str:
+    def upload(
+        self,
+        verbose: bool = True,
+    ) -> str:
         from datetime import datetime, timezone
-
-        import requests
 
         timestamp = datetime.now(timezone.utc).isoformat()
         root_trace = [
@@ -510,19 +555,368 @@ class EvaluationResult:
             },
             cls=ChainRunEncoder,
         )
-
-        response = requests.post(
-            f"{base_url}/alignment/evaluation",
-            data=packet,
-            headers={"Content-Type": "application/json"},
+        response = upload_packet(
+            path="/alignment/evaluation",
+            data_json_string=packet,
         )
 
-        if response.status_code != 200:
-            raise Exception(f"Failed to upload results: {response.text}")
+        # check status codes
+        app_url = get_app_url()
+        evaluation_app_url = build_evaluation_app_url(app_url, root_trace.run_id)
+        if response.status_code == 409:
+            # this evalution already exists
+            if verbose:
+                print(f"Evaluation run already exists. View at {evaluation_app_url}")
+            return evaluation_app_url
+        elif response.status_code != 200:
+            # any other error
+            raise UploadException(
+                status_code=response.status_code,
+                message=f"Failed to upload results: {response.text}",
+            )
 
-        evaluation_endpoint = (
-            f"https://app.ragas.io/alignment/evaluation/{root_trace.run_id}"
-        )
         if verbose:
-            print(f"Evaluation results uploaded! View at {evaluation_endpoint}")
-        return evaluation_endpoint
+            print(f"Evaluation results uploaded! View at {evaluation_app_url}")
+        return evaluation_app_url
+
+
+class PromptAnnotation(BaseModel):
+    prompt_input: t.Dict[str, t.Any]
+    prompt_output: t.Dict[str, t.Any]
+    edited_output: t.Optional[t.Dict[str, t.Any]] = None
+
+    def __getitem__(self, key):
+        return getattr(self, key)
+
+
+class SampleAnnotation(BaseModel):
+    metric_input: t.Dict[str, t.Any]
+    metric_output: float
+    prompts: t.Dict[str, PromptAnnotation]
+    is_accepted: bool
+    target: t.Optional[float] = None
+
+    def __getitem__(self, key):
+        return getattr(self, key)
+
+
+class MetricAnnotation(BaseModel):
+    root: t.Dict[str, t.List[SampleAnnotation]]
+
+    def __getitem__(self, key):
+        return SingleMetricAnnotation(name=key, samples=self.root[key])
+
+    @classmethod
+    def _process_dataset(
+        cls, dataset: dict, metric_name: t.Optional[str]
+    ) -> "MetricAnnotation":
+        """
+        Process raw dataset into MetricAnnotation format
+
+        Parameters
+        ----------
+        dataset : dict
+            Raw dataset to process
+        metric_name : str, optional
+            Name of the specific metric to filter
+
+        Returns
+        -------
+        MetricAnnotation
+            Processed annotation data
+        """
+        if metric_name is not None and metric_name not in dataset:
+            raise ValueError(f"Split {metric_name} not found in the dataset.")
+
+        return cls(
+            root={
+                key: [SampleAnnotation(**sample) for sample in value]
+                for key, value in dataset.items()
+                if metric_name is None or key == metric_name
+            }
+        )
+
+    @classmethod
+    def from_json(cls, path: str, metric_name: t.Optional[str]) -> "MetricAnnotation":
+        """Load annotations from a JSON file"""
+        dataset = json.load(open(path))
+        return cls._process_dataset(dataset, metric_name)
+
+    @classmethod
+    def from_app(
+        cls,
+        run_id: str,
+        metric_name: t.Optional[str] = None,
+    ) -> "MetricAnnotation":
+        """
+        Fetch annotations from a URL using either evaluation result or run_id
+
+        Parameters
+        ----------
+        run_id : str
+            Direct run ID to fetch annotations
+        metric_name : str, optional
+            Name of the specific metric to filter
+
+        Returns
+        -------
+        MetricAnnotation
+            Annotation data from the API
+
+        Raises
+        ------
+        ValueError
+            If run_id is not provided
+        """
+        if run_id is None:
+            raise ValueError("run_id must be provided")
+
+        endpoint = f"/api/v1/alignment/evaluation/annotation/{run_id}"
+
+        app_token = get_app_token()
+        base_url = get_api_url()
+        app_url = get_app_url()
+
+        response = requests.get(
+            f"{base_url}{endpoint}",
+            headers={
+                "Content-Type": "application/json",
+                "x-app-token": app_token,
+                "x-source": RAGAS_API_SOURCE,
+                "x-app-version": __version__,
+            },
+        )
+
+        check_api_response(response)
+        dataset = response.json()["data"]
+
+        if not dataset:
+            evaluation_url = build_evaluation_app_url(app_url, run_id)
+            raise ValueError(
+                f"No annotations found. Please annotate the Evaluation first then run this method. "
+                f"\nNote: you can annotate the evaluations using the Ragas app by going to {evaluation_url}"
+            )
+
+        return cls._process_dataset(dataset, metric_name)
+
+    def __len__(self):
+        return sum(len(value) for value in self.root.values())
+
+
+class SingleMetricAnnotation(BaseModel):
+    name: str
+    samples: t.List[SampleAnnotation]
+
+    def to_evaluation_dataset(self) -> EvaluationDataset:
+        samples = [sample.metric_input for sample in self.samples]
+        return EvaluationDataset.from_list(samples)
+
+    def __getitem__(self, idx):
+        return self.samples[idx]
+
+    def __repr__(self):
+        return f"SingleMetricAnnotation(name={self.name}, len={len(self.samples)})"
+
+    def __iter__(self) -> t.Iterator[SampleAnnotation]:  # type: ignore
+        return iter(self.samples)
+
+    def select(self, indices: t.List[int]) -> "SingleMetricAnnotation":
+        return SingleMetricAnnotation(
+            name=self.name,
+            samples=[self.samples[idx] for idx in indices],
+        )
+
+    @classmethod
+    def from_json(cls, path) -> "SingleMetricAnnotation":
+        dataset = json.load(open(path))
+
+        return cls(
+            name=dataset["name"],
+            samples=[SampleAnnotation(**sample) for sample in dataset["samples"]],
+        )
+
+    def filter(self, function: t.Optional[t.Callable] = None):
+        if function is None:
+            function = lambda x: True  # noqa: E731
+
+        return SingleMetricAnnotation(
+            name=self.name,
+            samples=[sample for sample in self.samples if function(sample)],
+        )
+
+    def __len__(self):
+        return len(self.samples)
+
+    def train_test_split(
+        self,
+        test_size: float = 0.2,
+        seed: int = 42,
+        stratify: t.Optional[t.List[t.Any]] = None,
+    ) -> t.Tuple["SingleMetricAnnotation", "SingleMetricAnnotation"]:
+        """
+        Split the dataset into training and testing sets.
+
+        Parameters:
+            test_size (float): The proportion of the dataset to include in the test split.
+            seed (int): Random seed for reproducibility.
+            stratify (list): The column values to stratify the split on.
+        """
+        raise NotImplementedError
+
+    def sample(
+        self, n: int, stratify_key: t.Optional[str] = None
+    ) -> "SingleMetricAnnotation":
+        """
+        Create a subset of the dataset.
+
+        Parameters:
+            n (int): The number of samples to include in the subset.
+            stratify_key (str): The column to stratify the subset on.
+
+        Returns:
+            SingleMetricAnnotation: A subset of the dataset with `n` samples.
+        """
+        if n > len(self.samples):
+            raise ValueError(
+                "Requested sample size exceeds the number of available samples."
+            )
+
+        if stratify_key is None:
+            # Simple random sampling
+            sampled_indices = random.sample(range(len(self.samples)), n)
+            sampled_samples = [self.samples[i] for i in sampled_indices]
+        else:
+            # Stratified sampling
+            class_groups = defaultdict(list)
+            for idx, sample in enumerate(self.samples):
+                key = sample[stratify_key]
+                class_groups[key].append(idx)
+
+            # Determine the proportion of samples to take from each class
+            total_samples = sum(len(indices) for indices in class_groups.values())
+            proportions = {
+                cls: len(indices) / total_samples
+                for cls, indices in class_groups.items()
+            }
+
+            sampled_indices = []
+            for cls, indices in class_groups.items():
+                cls_sample_count = int(np.round(proportions[cls] * n))
+                cls_sample_count = min(
+                    cls_sample_count, len(indices)
+                )  # Don't oversample
+                sampled_indices.extend(random.sample(indices, cls_sample_count))
+
+            # Handle any rounding discrepancies to ensure exactly `n` samples
+            while len(sampled_indices) < n:
+                remaining_indices = set(range(len(self.samples))) - set(sampled_indices)
+                if not remaining_indices:
+                    break
+                sampled_indices.append(random.choice(list(remaining_indices)))
+
+            sampled_samples = [self.samples[i] for i in sampled_indices]
+
+        return SingleMetricAnnotation(name=self.name, samples=sampled_samples)
+
+    def batch(
+        self,
+        batch_size: int,
+        drop_last_batch: bool = False,
+    ):
+        """
+        Create a batch iterator.
+
+        Parameters:
+            batch_size (int): The number of samples in each batch.
+            stratify (str): The column to stratify the batches on.
+            drop_last_batch (bool): Whether to drop the last batch if it is smaller than the specified batch size.
+        """
+
+        samples = self.samples[:]
+        random.shuffle(samples)
+
+        all_batches = [
+            samples[i : i + batch_size]
+            for i in range(0, len(samples), batch_size)
+            if len(samples[i : i + batch_size]) == batch_size or not drop_last_batch
+        ]
+
+        return all_batches
+
+    def stratified_batches(
+        self,
+        batch_size: int,
+        stratify_key: str,
+        drop_last_batch: bool = False,
+        replace: bool = False,
+    ) -> t.List[t.List[SampleAnnotation]]:
+        """
+        Create stratified batches based on a specified key, ensuring proportional representation.
+
+        Parameters:
+            batch_size (int): Number of samples per batch.
+            stratify_key (str): Key in `metric_input` used for stratification (e.g., class labels).
+            drop_last_batch (bool): If True, drops the last batch if it has fewer samples than `batch_size`.
+            replace (bool): If True, allows reusing samples from the same class to fill a batch if necessary.
+
+        Returns:
+            List[List[SampleAnnotation]]: A list of stratified batches, each batch being a list of SampleAnnotation objects.
+        """
+        # Group samples based on the stratification key
+        class_groups = defaultdict(list)
+        for sample in self.samples:
+            key = sample[stratify_key]
+            class_groups[key].append(sample)
+
+        # Shuffle each class group for randomness
+        for group in class_groups.values():
+            random.shuffle(group)
+
+        # Determine the number of batches required
+        total_samples = len(self.samples)
+        num_batches = (
+            np.ceil(total_samples / batch_size).astype(int)
+            if drop_last_batch
+            else np.floor(total_samples / batch_size).astype(int)
+        )
+        samples_per_class_per_batch = {
+            cls: max(1, len(samples) // num_batches)
+            for cls, samples in class_groups.items()
+        }
+
+        # Create stratified batches
+        all_batches = []
+        while len(all_batches) < num_batches:
+            batch = []
+            for cls, samples in list(class_groups.items()):
+                # Determine the number of samples to take from this class
+                count = min(
+                    samples_per_class_per_batch[cls],
+                    len(samples),
+                    batch_size - len(batch),
+                )
+                if count > 0:
+                    # Add samples from the current class
+                    batch.extend(samples[:count])
+                    class_groups[cls] = samples[count:]  # Remove used samples
+                elif replace and len(batch) < batch_size:
+                    # Reuse samples if `replace` is True
+                    batch.extend(random.choices(samples, k=batch_size - len(batch)))
+
+            # Shuffle the batch to mix classes
+            random.shuffle(batch)
+            if len(batch) == batch_size or not drop_last_batch:
+                all_batches.append(batch)
+
+        return all_batches
+
+    def get_prompt_annotations(self) -> t.Dict[str, t.List[PromptAnnotation]]:
+        """
+        Get all the prompt annotations for each prompt as a list.
+        """
+        prompt_annotations = defaultdict(list)
+        for sample in self.samples:
+            if sample.is_accepted:
+                for prompt_name, prompt_annotation in sample.prompts.items():
+                    prompt_annotations[prompt_name].append(prompt_annotation)
+        return prompt_annotations
